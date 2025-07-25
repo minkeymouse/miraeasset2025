@@ -27,6 +27,7 @@ class DartCrawler:
                          '연결재무제표주석']
         self.debug_mode = False
         self.url_dict = {}
+        self.xml_content = None
 
     def get_html_directly(self, url):
         """URL에서 직접 HTML 데이터를 가져옵니다."""
@@ -213,6 +214,7 @@ class DartCrawler:
                             merged_meta_tables = self.merge_table_with_metadata_2(preprocessed_tables, ref_date)  # 임시로 그대로 통과
                             # TODO: 나중에 merge_note_with_metadata 함수 구현
                             # merged_meta_tables = self.merge_note_with_metadata(preprocessed_tables, ref_date)
+                            
                         else:
                             # 기존 재무제표 처리 로직
                             merged_meta_tables = self.merge_table_with_metadata(preprocessed_tables, ref_date)
@@ -220,6 +222,91 @@ class DartCrawler:
                         # 결과 저장
                         results[f"{company_name}_{company_code}_{year}_{report_code}_{report_name}_{keyword}"] = merged_meta_tables
                         logger.info(f"{company_name}_{company_code}_{year}_{report_code}_{report_name}_{keyword} 저장 완료")
+                    except Exception as e:
+                        logger.error(f"테이블 처리 중 오류 발생 (URL: {url}): {str(e)}")
+                        continue
+                
+            except Exception as e:
+                logger.error(f"보고서 처리 중 오류 발생 ({report_name}, {year}): {str(e)}")
+                continue
+                
+        return results
+
+    def crawl_company_annotations(self, company_code, year):
+        """특정 회사의 특정 연도의 연결재무제표 주석들을 분류합니다."""
+        results = {}
+        company_name = stock.get_market_ticker_name(company_code)
+        # 현재 날짜 체크
+        current_date = datetime.now()
+        current_year = current_date.year
+        current_month = current_date.month
+
+        for report_name, report_code in self.report_codes.items():
+            if year == current_year:
+                if report_code == '11011':  # 사업보고서
+                    logger.info(f"{year}년 사업보고서는 아직 제출 시기가 아닙니다.")
+                    continue
+                elif report_code == '11014' and current_month < 11:  # 3분기
+                    logger.info(f"{year}년 3분기보고서는 아직 제출 시기가 아닙니다.")
+                    continue
+                elif report_code == '11012' and current_month < 8:  # 반기
+                    logger.info(f"{year}년 반기보고서는 아직 제출 시기가 아닙니다.")
+                    continue
+                elif report_code == '11013' and current_month < 5:  # 1분기
+                    logger.info(f"{year}년 1분기보고서는 아직 제출 시기가 아닙니다.")
+                    continue
+            try:
+                # 1. 공시 번호 가져오기
+                finstate = self.dart.finstate(company_code, year, reprt_code=report_code)
+                if finstate is None or finstate.empty or 'rcept_no' not in finstate.columns:
+                    logger.info(f"No data found for {company_code} in {year}년_{report_name}")
+                    continue
+                    
+                rcept_no = finstate['rcept_no'].iloc[0]
+                date_part = str(rcept_no)[:8]
+                ref_date = standardize_date(date_part)
+                logger.info(f"{company_code}_{year}년_{report_name} 검색 완료")
+
+                # 2. 문서 URL 가져오기
+                for keyword in self.keywords:
+                    try:
+                        df_docs = self.dart.sub_docs(rcept_no, match=keyword)
+                        if df_docs.empty:
+                            logger.info(f"키워드 '{keyword}'에 대한 공시 문서가 존재하지 않습니다.")
+                            continue
+                        
+                        matching_docs = df_docs.head(1)
+                        if matching_docs.empty:
+                            logger.info(f"키워드 '{keyword}'와 정확히 일치하는 문서가 없습니다.")
+                            continue
+                        keyword = keyword.replace(' ', '_')
+                        url = matching_docs['url'].iloc[0]
+                        self.url_dict[keyword] = url
+                    except Exception as e:
+                        logger.error(f"URL 검색 중 오류 발생 (keyword: {keyword}): {str(e)}")
+                        continue
+                
+                # URL을 찾지 못한 경우 다음 보고서로
+                if not self.url_dict:
+                    logger.info(f"{report_name}에서 처리할 URL을 찾지 못했습니다.")
+                    continue
+                
+                # 3. 각 URL에 대해 처리
+                for keyword, url in self.url_dict.items():
+                    try:
+                        # XML 직접 가져오기
+                        html_content = self.get_html_directly(url)
+                        
+                        # 키워드에 따라 다른 처리 로직 적용
+                        if '주석' in keyword:
+                            # 주석용 처리 로직
+                            # merged_meta_tables = self.merge_table_with_metadata_2(preprocessed_tables, ref_date)  # 임시로 그대로 통과
+                            # TODO: 나중에 merge_note_with_metadata 함수 구현
+                            # merged_meta_tables = self.merge_note_with_metadata(preprocessed_tables, ref_date)
+                            decoded_text = html_content.decode("utf-8")
+                            section_dict = self.split_html_sections_by_numbered_p(decoded_text)
+                            results = section_dict
+                        logger.info(f"{company_name}_{company_code}_{year}_{report_code}_{report_name}_{keyword} 주석 분류 저장 완료")
                     except Exception as e:
                         logger.error(f"테이블 처리 중 오류 발생 (URL: {url}): {str(e)}")
                         continue
@@ -340,3 +427,26 @@ class DartCrawler:
             print(f"데이터프레임 처리 중 오류 발생: {str(e)}")
 
         return merged_tables
+
+    def split_html_sections_by_numbered_p(self, html: str) -> dict:
+        # <P>, <P><BR/>, <P><SPAN> 등 다양한 조합을 포괄적으로 대응
+        pattern = re.compile(
+            r"<P[^>]*>(?:<BR/?>|\s|&nbsp;|<SPAN[^>]*>|</SPAN>)*\s*(\d{1,2})[.]\s*([^<\r\n]*)",
+            re.IGNORECASE
+        )
+
+        matches = list(pattern.finditer(html))
+        result = {}
+
+        for i in range(len(matches)):
+            start = matches[i].start()
+            end = matches[i + 1].start() if i + 1 < len(matches) else len(html)
+            section_html = html[start:end]
+
+            number = matches[i].group(1).strip()
+            title = matches[i].group(2).strip()
+            key = f"{number}. {title}" if title else f"{number}."
+
+            result[key] = section_html.strip()
+
+        return result
